@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilibili 播放器旋转 / 缩放 / 镜像
 // @namespace    https://github.com/shengurun/bilibili-video-rotate
-// @version      1.2.0
-// @description  在 B 站播放器上旋转 90°、水平/垂直镜像并按真实画面自动适配（默认完整显示，网页全屏时铺满整个浏览器窗口），只变换 <video>，不旋转弹幕/字幕/控制条。单击悬浮按钮快速切换旋转，右键打开控制面板。
+// @version      1.3.0
+// @description  在 B 站播放器上旋转 90°、水平/垂直镜像并按真实画面自动适配（默认完整显示，网页全屏时铺满整个浏览器窗口），只变换 <video>，不旋转弹幕/字幕/控制条；同一视频内切换标签页或播放器重建后保留变换。单击悬浮按钮快速切换旋转，右键打开控制面板。
 // @author       shengurun
 // @match        https://www.bilibili.com/*
 // @run-at       document-idle
@@ -40,10 +40,12 @@
  *   - 网页全屏 / 原生全屏时以整个浏览器窗口为基准缩放，超出播放器边界的画面由播放器正常裁剪，
  *     不修改页面内层容器的 overflow。
  *   - 进入网页全屏 / 原生全屏后自动隐藏悬浮按钮与控制面板；退出后按钮回到原位置。
- *   - 旋转/缩放/镜像只在当前会话有效；切换视频（URL 变化或 video 元素被替换）
- *     自动回到 0°/1x/无镜像。
+ *   - 旋转/缩放/镜像在同一视频内保留：播放器节点被替换、切换标签页、
+ *     标签页被浏览器挂起重载后都会恢复；切换视频 / 分 P / 剧集或点「重置」
+ *     才回到 0°/1x/无镜像。
  *   - 画质切换、迷你播放器（按迷你窗口尺寸）、网页全屏、原生全屏只重算缩放，不重置角度与镜像。
  *   - 过渡动画只在手动旋转 / 微调 / 缩放时播放；镜像、弹幕、控制条、全屏等布局变化即时应用，不会重放动画。
+ *   - 变换状态只保留在当前标签页会话内（sessionStorage），不会跨标签页共享，关闭标签页即失效。
  *   - 悬浮按钮位置与「铺满/完整显示」偏好会持久化；旧版本（br:icon / br:prefs）的设置会自动迁移。
  *   - 播放器选择器未经真实页面验证（规划阶段 B 站返回 412），已做多级回退；
  *     找不到播放器时脚本静默隐藏，不影响页面。
@@ -59,6 +61,9 @@
   const CLASS_MEASURE = 'bili-video-rotate-measure';
   const KEY_ICON = 'bvr:icon';
   const KEY_PREFS = 'bvr:prefs';
+  const KEY_SESSION = 'bvr:session';
+  const KEY_DEBUG = 'bvr:debug';
+  const SESSION_TTL = 12 * 60 * 60 * 1000;
 
   /* 旧版本名称，仅用于一次性设置迁移与残留清理 */
   const LEGACY_APP_ID = 'bili-rotate-root';
@@ -178,6 +183,8 @@
   /* 只有用户显式保存的 cover 才保留，其余（含旧安装）一律完整显示 */
   if (prefs.fit !== 'cover') prefs.fit = 'contain';
 
+  const debugEnabled = !!readStored(KEY_DEBUG);
+
   const state = {
     quarterTurns: 0,
     fine: 0,
@@ -215,6 +222,32 @@
 
   function currentAngle() {
     return state.quarterTurns * 90 + state.fine;
+  }
+
+  /* 只比较视频身份，忽略 spm_id_from / vd_source / t / hash 等跟踪参数 */
+  function mediaKey() {
+    let path = '/';
+    try {
+      path = String(window.location.pathname || '/');
+    } catch (err) {
+      path = '/';
+    }
+
+    let page = 1;
+    try {
+      const value = parseInt(new window.URLSearchParams(window.location.search).get('p'), 10);
+      if (isFinite(value) && value > 0) page = value;
+    } catch (err) {
+      page = 1;
+    }
+
+    let match = path.match(/^\/video\/(BV[0-9A-Za-z]+|av\d+)/i);
+    if (match) return 'video:' + match[1] + '|p:' + page;
+    match = path.match(/^\/bangumi\/play\/(ep\d+|ss\d+)/i);
+    if (match) return 'bangumi:' + match[1] + '|p:' + page;
+
+    /* 识别不出的路由（如 /list/）只按路径比较，避免 query 变化导致误重置 */
+    return 'path:' + path + '|p:' + page;
   }
 
   function isTransformActive() {
@@ -367,6 +400,8 @@
   let rafId = 0;
   let trackedVideo = null;
   let trackedUrl = window.location.href;
+  let trackedMedia = null;
+  let resetReason = '';
   let metrics = null;
   let animTimer = 0;
   let animateNext = false;
@@ -717,6 +752,85 @@
     }
   }
 
+  /* ---------- 会话状态 ---------- */
+
+  function readSession() {
+    try {
+      const raw = window.sessionStorage.getItem(KEY_SESSION);
+      if (!raw) return null;
+      const data = JSON.parse(raw);
+      if (!data || typeof data !== 'object') return null;
+      if (typeof data.mediaKey !== 'string' || !data.mediaKey) return null;
+      if (typeof data.savedAt !== 'number' || !isFinite(data.savedAt)) return null;
+      const age = Date.now() - data.savedAt;
+      if (age < 0 || age > SESSION_TTL) return null;
+      return data;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function clearSession() {
+    try {
+      window.sessionStorage.removeItem(KEY_SESSION);
+    } catch (err) {
+      /* sessionStorage 不可用时保持内存态 */
+    }
+  }
+
+  /* 没有变换时不写键，让「重置」后的会话状态保持干净 */
+  function persistSession() {
+    if (!isTransformActive()) {
+      clearSession();
+      return;
+    }
+    if (!trackedMedia) return;
+    try {
+      window.sessionStorage.setItem(KEY_SESSION, JSON.stringify({
+        mediaKey: trackedMedia,
+        quarterTurns: state.quarterTurns,
+        fine: state.fine,
+        zoom: state.zoom,
+        flipX: state.flipX,
+        flipY: state.flipY,
+        savedAt: Date.now()
+      }));
+    } catch (err) {
+      /* sessionStorage 不可用或写入失败时静默降级 */
+    }
+  }
+
+  function sessionNumber(value, fallback) {
+    const num = typeof value === 'number' ? value : parseFloat(value);
+    return isFinite(num) ? num : fallback;
+  }
+
+  /* 只在同一标签页、同一视频且未过期时恢复；返回恢复所用的媒体身份 */
+  function restoreSession() {
+    const saved = readSession();
+    if (!saved) return null;
+    const current = mediaKey();
+    if (!current || saved.mediaKey !== current) return null;
+
+    state.quarterTurns = Math.round(sessionNumber(saved.quarterTurns, 0));
+    state.fine = clamp(round1(sessionNumber(saved.fine, 0)), -FINE_LIMIT, FINE_LIMIT);
+    if (state.fine === 0) state.fine = 0;
+    state.zoom = clamp(sessionNumber(saved.zoom, 1), ZOOM_MIN, ZOOM_MAX);
+    state.flipX = !!saved.flipX;
+    state.flipY = !!saved.flipY;
+    return current;
+  }
+
+  function resetTransformState(reason) {
+    state.quarterTurns = 0;
+    state.fine = 0;
+    state.zoom = 1;
+    state.flipX = false;
+    state.flipY = false;
+    resetReason = reason || '';
+    clearSession();
+  }
+
   /* ---------- 悬浮 UI ---------- */
 
   const host = document.createElement('div');
@@ -956,12 +1070,14 @@
       state.zoom = 1;
     }
     scheduleUpdate(true);
+    persistSession();
     syncUI();
   }
 
   function stepQuarter(direction) {
     state.quarterTurns += direction;
     scheduleUpdate(true);
+    persistSession();
     syncUI();
   }
 
@@ -969,6 +1085,7 @@
     state.fine = clamp(round1(value), -FINE_LIMIT, FINE_LIMIT);
     if (state.fine === 0) state.fine = 0;
     scheduleUpdate(true);
+    persistSession();
     syncUI();
   }
 
@@ -976,6 +1093,7 @@
     const next = Math.round((state.zoom + direction * prefs.zoomStep) * 10) / 10;
     state.zoom = clamp(next, ZOOM_MIN, ZOOM_MAX);
     scheduleUpdate(true);
+    persistSession();
     syncUI();
   }
 
@@ -992,16 +1110,13 @@
     else state.flipY = !state.flipY;
     /* 镜像必须瞬时生效：1 → -1 的过渡会让画面经过 0 宽度而闪烁 */
     scheduleUpdate(false);
+    persistSession();
     syncUI();
   }
 
   function resetTransform() {
     const hadFlip = state.flipX || state.flipY;
-    state.quarterTurns = 0;
-    state.fine = 0;
-    state.zoom = 1;
-    state.flipX = false;
-    state.flipY = false;
+    resetTransformState('explicit');
     scheduleUpdate(!hadFlip);
     syncUI();
   }
@@ -1299,6 +1414,21 @@
     }
   }
 
+  function navigationType() {
+    try {
+      if (window.performance && typeof window.performance.getEntriesByType === 'function') {
+        const entries = window.performance.getEntriesByType('navigation');
+        if (entries && entries.length && entries[0] && entries[0].type) return entries[0].type;
+      }
+      if (window.performance && window.performance.navigation) {
+        return ['navigate', 'reload', 'back_forward'][window.performance.navigation.type] || '';
+      }
+    } catch (err) {
+      /* 部分沙箱不提供 Navigation Timing */
+    }
+    return '';
+  }
+
   function logDiagnostics() {
     const video = activePlayer && activePlayer.video;
     let dataScreen = '';
@@ -1311,6 +1441,12 @@
     if (!video || !video.isConnected) {
       console.log('[bilibili-video-rotate] 旋转/镜像诊断：未找到播放器', {
         url: window.location.href,
+        trackedUrl: trackedUrl,
+        mediaKey: mediaKey(),
+        trackedMedia: trackedMedia,
+        visibility: document.visibilityState,
+        navigationType: navigationType(),
+        resetReason: resetReason,
         dataScreen: dataScreen,
         immersive: isImmersive(),
         fullscreenElement: describeNode(getFullscreenElement()),
@@ -1318,6 +1454,7 @@
         container: describeNode(activePlayer && activePlayer.container),
         flipX: state.flipX,
         flipY: state.flipY,
+        appliedClass: false,
         stats: { updates: stats.updates, writes: stats.writes, measures: stats.measures }
       });
       return;
@@ -1338,20 +1475,29 @@
     let appliedScale = null;
     let appliedFlipX = null;
     let appliedFlipY = null;
+    let appliedClass = false;
     try {
       appliedAngle = video.style.getPropertyValue('--bvr-angle').trim() || null;
       appliedScale = video.style.getPropertyValue('--bvr-scale').trim() || null;
       appliedFlipX = video.style.getPropertyValue('--bvr-flip-x').trim() || null;
       appliedFlipY = video.style.getPropertyValue('--bvr-flip-y').trim() || null;
+      appliedClass = video.classList.contains(CLASS_ACTIVE);
     } catch (err) {
       appliedAngle = null;
       appliedScale = null;
       appliedFlipX = null;
       appliedFlipY = null;
+      appliedClass = false;
     }
 
     const info = {
       url: window.location.href,
+      trackedUrl: trackedUrl,
+      mediaKey: mediaKey(),
+      trackedMedia: trackedMedia,
+      visibility: document.visibilityState,
+      navigationType: navigationType(),
+      resetReason: resetReason,
       dataScreen: dataScreen,
       immersive: isImmersive(),
       fullscreenElement: describeNode(getFullscreenElement()),
@@ -1375,6 +1521,7 @@
       appliedScale: appliedScale,
       appliedFlipX: appliedFlipX,
       appliedFlipY: appliedFlipY,
+      appliedClass: appliedClass,
       stats: { updates: stats.updates, writes: stats.writes, measures: stats.measures },
       metricsCached: !!metrics,
       metrics: metrics
@@ -1552,52 +1699,83 @@
 
   /* ---------- 生命周期 ---------- */
 
+  function debugLog(data) {
+    if (!debugEnabled) return;
+    try {
+      console.log('[bilibili-video-rotate] detect', data);
+    } catch (err) {
+      /* 控制台不可用时忽略 */
+    }
+  }
+
   function detect() {
-    const urlChanged = window.location.href !== trackedUrl;
-    /* URL 变化时不保留旧 video 的稳定性偏好 */
-    const found = findActivePlayer(urlChanged ? null : trackedVideo);
+    const url = window.location.href;
+    const nextMedia = mediaKey();
+    const mediaChanged = trackedMedia !== null && trackedMedia !== nextMedia;
+    /* 只有真正换视频时才放弃旧 video 的稳定性偏好，URL 跟踪参数变化不影响 */
+    const found = findActivePlayer(mediaChanged ? null : trackedVideo);
+
+    if (mediaChanged) {
+      resetTransformState('media-change');
+      syncUI();
+    }
+    if (trackedMedia === null) {
+      trackedMedia = nextMedia;
+      /* 首次加载且没有可恢复的会话时，覆盖同标签页遗留的旧键 */
+      clearSession();
+    } else if (mediaChanged) {
+      trackedMedia = nextMedia;
+    }
 
     if (!found) {
       cancelAnim();
       metrics = null;
       if (activePlayer) clearVideoStyles(activePlayer.video);
       activePlayer = null;
-      trackedVideo = null;
+      /* 旧节点仍连接时保留身份锚点，避免下一次 detect 误判为节点被替换 */
+      if (trackedVideo && !trackedVideo.isConnected) trackedVideo = null;
+      trackedUrl = url;
       setUIVisible(false);
       releaseSizes();
       releasePlayerState();
+      debugLog({
+        url: url,
+        mediaKey: nextMedia,
+        mediaChanged: mediaChanged,
+        videoChanged: false,
+        found: false,
+        resetReason: resetReason
+      });
       return;
     }
 
     const videoChanged = trackedVideo !== found.video;
-    /* 旧 video 断开或不可用时才算真正替换（如切集）；画质切换换节点也按替换处理 */
-    const replaced =
-      videoChanged &&
-      (!trackedVideo || !trackedVideo.isConnected || !isUsableVideo(trackedVideo));
-
     if (videoChanged) {
       metrics = null;
       cancelAnim();
       if (trackedVideo) clearVideoStyles(trackedVideo);
     }
 
-    if (urlChanged || replaced) {
-      state.quarterTurns = 0;
-      state.fine = 0;
-      state.zoom = 1;
-      state.flipX = false;
-      state.flipY = false;
-      syncUI();
-    }
-
     trackedVideo = found.video;
-    trackedUrl = window.location.href;
+    trackedUrl = url;
     activePlayer = found;
     observeSizes(found);
     observePlayerState();
+    observeShadowRoot(found.video);
     placeHost();
     syncChrome();
     scheduleUpdate(false);
+
+    debugLog({
+      url: url,
+      mediaKey: nextMedia,
+      mediaChanged: mediaChanged,
+      videoChanged: videoChanged,
+      found: true,
+      trackedVideoConnected: !!(trackedVideo && trackedVideo.isConnected),
+      video: describeNode(found.video),
+      resetReason: resetReason
+    });
   }
 
   let mutationObserver = null;
@@ -1653,6 +1831,83 @@
     mutationObserver.observe(document.body, { childList: true, subtree: true });
   }
 
+  /* document.body 观察不到 shadow root 内的播放器重建，单独补一个观察器 */
+  let shadowObserver = null;
+  let shadowRoot = null;
+  let shadowTimer = 0;
+
+  function observeShadowRoot(video) {
+    if (typeof window.MutationObserver !== 'function') return;
+    let root = null;
+    try {
+      root = video && typeof video.getRootNode === 'function' ? video.getRootNode() : null;
+    } catch (err) {
+      root = null;
+    }
+
+    if (!root || root.nodeType !== 11 || !root.host) {
+      if (shadowRoot) {
+        if (shadowObserver) {
+          try { shadowObserver.disconnect(); } catch (err) {}
+        }
+        shadowRoot = null;
+      }
+      return;
+    }
+    if (root === shadowRoot) return;
+
+    if (!shadowObserver) {
+      shadowObserver = new window.MutationObserver(function (records) {
+        const stale = !!(activePlayer && activePlayer.video && !activePlayer.video.isConnected);
+        if (!stale && !hasStructureChange(records)) return;
+        if (shadowTimer) return;
+        shadowTimer = window.setTimeout(function () {
+          shadowTimer = 0;
+          detect();
+        }, 250);
+      });
+    }
+
+    try { shadowObserver.disconnect(); } catch (err) {}
+    try {
+      shadowObserver.observe(root, { childList: true, subtree: true });
+      shadowRoot = root;
+    } catch (err) {
+      shadowRoot = null;
+    }
+  }
+
+  let restoreTimer = 0;
+
+  function scheduleRestore() {
+    /* 已有 detect 在排队时直接复用，避免同一时刻跑两次 */
+    if (restoreTimer || stateTimer || mutationTimer) return;
+    restoreTimer = window.setTimeout(function () {
+      restoreTimer = 0;
+      detect();
+    }, 150);
+  }
+
+  function handleVisibilityChange() {
+    if (document.visibilityState === 'hidden') {
+      persistSession();
+      return;
+    }
+    scheduleRestore();
+  }
+
+  function handlePageHide() {
+    persistSession();
+  }
+
+  function handlePageShow(event) {
+    if (!event || event.persisted) scheduleRestore();
+  }
+
+  function handleResume() {
+    scheduleRestore();
+  }
+
   function hookHistory() {
     const notify = function () {
       window.setTimeout(detect, 0);
@@ -1675,6 +1930,10 @@
 
   /* ---------- 初始化 ---------- */
 
+  /* 同一标签页重载（含标签页被丢弃）后恢复变换；只在媒体身份一致时生效 */
+  const restoredMedia = restoreSession();
+  if (restoredMedia) trackedMedia = restoredMedia;
+
   injectStyle();
   applyIconPos();
   syncUI();
@@ -1682,10 +1941,16 @@
   hookHistory();
   detect();
 
+  document.addEventListener('visibilitychange', handleVisibilityChange);
+  window.addEventListener('pagehide', handlePageHide);
+  window.addEventListener('pageshow', handlePageShow);
+  window.addEventListener('resume', handleResume);
   document.addEventListener('fullscreenchange', handleViewportChange);
   document.addEventListener('webkitfullscreenchange', handleViewportChange);
   document.addEventListener('loadedmetadata', function () {
-    scheduleUpdate(false);
+    /* 播放器重建后 activePlayer 可能已清空，元数据就绪时重新识别一次 */
+    if (!activePlayer) detect();
+    else scheduleUpdate(false);
   }, true);
   document.addEventListener('resize', function () {
     scheduleUpdate(false);
