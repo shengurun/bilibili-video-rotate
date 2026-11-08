@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilibili 播放器旋转 / 缩放 / 镜像
 // @namespace    https://github.com/shengurun/bilibili-video-rotate
-// @version      1.3.0
-// @description  在 B 站播放器上旋转 90°、水平/垂直镜像并按真实画面自动适配（默认完整显示，网页全屏时铺满整个浏览器窗口），只变换 <video>，不旋转弹幕/字幕/控制条；同一视频内切换标签页或播放器重建后保留变换。单击悬浮按钮快速切换旋转，右键打开控制面板。
+// @version      1.4.1
+// @description  在 B 站播放器上旋转 90°、水平/垂直镜像并按真实画面自动适配（默认完整显示，网页全屏时铺满整个浏览器窗口），不旋转弹幕/字幕/控制条；同一视频内切换标签页或播放器重建后保留变换。新增 WebGL 渲染实验模式（默认关闭）。单击悬浮按钮快速切换旋转，右键打开控制面板。
 // @author       shengurun
 // @match        https://www.bilibili.com/*
 // @run-at       document-idle
@@ -22,15 +22,25 @@
  *
  * 操作
  *   - 单击悬浮按钮：在「原始画面」与「逆时针 90° + 按当前适配模式缩放」之间切换，镜像状态保留。
- *   - 右键悬浮按钮：打开控制面板（90° 步进 / ±15° 微调 / 水平与垂直镜像 / 缩放 / 铺满或完整显示 / 重置）。
+ *   - 右键悬浮按钮：打开控制面板（90° 步进 / ±15° 微调 / 水平与垂直镜像 / 缩放 / 铺满或完整显示 / 渲染模式 / 重置）。
  *   - 拖动悬浮按钮：吸附到屏幕左/右边缘，位置会保存。
  *   - 脚本菜单「旋转 / 还原」：不依赖悬浮按钮的备用开关（全屏时也可用）。
  *   - 脚本菜单「水平镜像 / 还原」「垂直镜像 / 还原」：全屏隐藏悬浮 UI 时切换镜像。
+ *   - 脚本菜单「切换 CSS / WebGL 渲染」：全屏隐藏悬浮 UI 时切换渲染模式。
  *   - 脚本菜单「重置悬浮按钮位置」：把按钮放回右侧居中。
- *   - 脚本菜单「输出旋转诊断信息」：在控制台打印当前画面盒/基准区域/镜像等实测数值。
+ *   - 脚本菜单「输出旋转诊断信息」：在控制台打印当前画面盒/基准区域/镜像/渲染器等实测数值。
+ *
+ * 渲染模式
+ *   - CSS（默认）：直接对 <video> 应用 transform。兼容性最好，但非零旋转会让 Chrome
+ *     放弃视频硬件 overlay，播放时 GPU 合成占用显著升高（实测 90° 约 72%）。
+ *   - WebGL（实验）：把视频帧上传为纹理，在覆盖播放器区域的 <canvas> 内完成旋转/镜像/缩放，
+ *     页面只合成一个未变换的 canvas，用于验证能否重新获得低耗合成路径。默认关闭。
+ *   - WebGL 模式不支持 HDR / DRM / 非居中 object-position / 铺满（cover），Phase 1 仅完整显示（contain）；
+ *     纹理上传失败、黑帧、上下文丢失或取不到新帧时自动回退 CSS，偏好设置保持不变。
+ *   - WebGL 模式没有 0.22s 过渡动画，旋转/缩放即时生效。
  *
  * 行为说明
- *   - 只变换 <video>，弹幕、字幕、控制条保持正向不动（已知取舍）。
+ *   - 只变换 <video>（CSS 模式）或覆盖播放器的 canvas 内容（WebGL 模式），弹幕、字幕、控制条保持正向不动（已知取舍）。
  *   - 缩放按视频真实画面（object-fit 内容盒）与屏幕坐标计算，而不是元素盒布局尺寸。
  *   - 镜像不改变画面的轴对齐包围盒，因此不影响旋转后的适配计算；
  *     同时开启两向镜像视觉上等同 180°，但角度状态仍为 0°。
@@ -59,6 +69,9 @@
   const CLASS_ACTIVE = 'bili-video-rotate-active';
   const CLASS_ANIM = 'bili-video-rotate-anim';
   const CLASS_MEASURE = 'bili-video-rotate-measure';
+  /* WebGL 模式隐藏 <video> 时打上的标记：isUsableVideo() 会据此忽略 visibility/opacity */
+  const CLASS_WEBGL = 'bili-video-rotate-webgl-hidden';
+  const CLASS_CANVAS = 'bili-video-rotate-webgl-canvas';
   const KEY_ICON = 'bvr:icon';
   const KEY_PREFS = 'bvr:prefs';
   const KEY_SESSION = 'bvr:session';
@@ -126,6 +139,19 @@
           el.classList.remove(CLASS_MEASURE);
           el.classList.remove(CLASS_ANIM);
         });
+
+      /* 上一次实验模式可能留下 canvas / 隐藏标记 */
+      document.querySelectorAll('canvas.' + CLASS_CANVAS).forEach(function (el) {
+        if (el.parentNode) el.parentNode.removeChild(el);
+      });
+      document.querySelectorAll('.' + CLASS_WEBGL).forEach(function (el) {
+        try {
+          if (el.style.getPropertyValue('visibility') === 'hidden') el.style.removeProperty('visibility');
+          if (el.style.getPropertyValue('opacity') === '0') el.style.removeProperty('opacity');
+          if (el.style.getPropertyValue('pointer-events') === 'none') el.style.removeProperty('pointer-events');
+        } catch (err) {}
+        el.classList.remove(CLASS_WEBGL);
+      });
     } catch (err) {
       /* 旧实例清理失败时不影响新实例 */
     }
@@ -172,7 +198,7 @@
     return legacy;
   }
 
-  const DEFAULT_PREFS = { quickAngle: -90, fit: 'contain', zoomStep: ZOOM_STEP };
+  const DEFAULT_PREFS = { quickAngle: -90, fit: 'contain', zoomStep: ZOOM_STEP, renderMode: 'css' };
   const storedPrefs = storedOrMigrate(KEY_PREFS, LEGACY_KEY_PREFS);
   const prefs = Object.assign(
     {},
@@ -182,6 +208,8 @@
   prefs.quickAngle = -90;
   /* 只有用户显式保存的 cover 才保留，其余（含旧安装）一律完整显示 */
   if (prefs.fit !== 'cover') prefs.fit = 'contain';
+  /* 实验模式必须显式开启；旧版本没有该字段时保持 CSS */
+  if (prefs.renderMode !== 'webgl') prefs.renderMode = 'css';
 
   const debugEnabled = !!readStored(KEY_DEBUG);
 
@@ -305,8 +333,11 @@
       return true;
     }
     if (!cs) return true;
-    if (cs.display === 'none' || cs.visibility === 'hidden') return false;
-    if (parseFloat(cs.opacity) === 0) return false;
+    if (cs.display === 'none') return false;
+    /* WebGL 模式会主动隐藏当前 video，不能因此把它判定为不可用 */
+    const webglHidden = video.classList && video.classList.contains(CLASS_WEBGL);
+    if (!webglHidden && cs.visibility === 'hidden') return false;
+    if (!webglHidden && parseFloat(cs.opacity) === 0) return false;
     return true;
   }
 
@@ -406,6 +437,10 @@
   let animTimer = 0;
   let animateNext = false;
   let instantNext = false;
+  /* 本视频内 WebGL 回退后不再重试；换视频时重置 */
+  let webglBlocked = false;
+  let webglFallbackReason = '';
+  let webglSkipReasonCurrent = '';
   const stats = { updates: 0, writes: 0, measures: 0 };
 
   function scheduleUpdate(animate) {
@@ -500,6 +535,15 @@
     };
   }
 
+  /* WebGL Phase 1 只支持居中的 object-position */
+  function isCenteredObjectPosition(value) {
+    const text = String(value || '').toLowerCase().trim();
+    if (!text || text === 'center' || text === 'center center') return true;
+    return text.split(/\s+/).every(function (part) {
+      return part === 'center' || part === '50%';
+    });
+  }
+
   function resolveStage(player, boxRect) {
     if (isImmersive()) {
       return {
@@ -585,10 +629,14 @@
   function layoutSignature(player, video, stage) {
     const size = layoutSize(video);
     let objectFit = 'contain';
+    let objectPosition = '';
     try {
-      objectFit = String(window.getComputedStyle(video).objectFit || 'contain').toLowerCase();
+      const cs = window.getComputedStyle(video);
+      objectFit = String(cs.objectFit || 'contain').toLowerCase();
+      objectPosition = String(cs.objectPosition || '').toLowerCase();
     } catch (err) {
       objectFit = 'contain';
+      objectPosition = '';
     }
     return {
       stageW: stage ? stage.width : 0,
@@ -598,6 +646,7 @@
       intrinsicW: video.videoWidth || 0,
       intrinsicH: video.videoHeight || 0,
       objectFit: objectFit,
+      objectPosition: objectPosition,
       immersive: isImmersive()
     };
   }
@@ -620,6 +669,7 @@
       prev.intrinsicW === next.intrinsicW &&
       prev.intrinsicH === next.intrinsicH &&
       prev.objectFit === next.objectFit &&
+      prev.objectPosition === next.objectPosition &&
       prev.immersive === next.immersive
     );
   }
@@ -676,6 +726,7 @@
     const current = activePlayer;
     if (!current || !current.video || !current.video.isConnected) {
       cancelAnim();
+      if (renderer.active) renderer.deactivate();
       return;
     }
 
@@ -685,6 +736,7 @@
       cancelAnim(video);
       clearVideoStyles(video);
       metrics = null;
+      if (renderer.active) renderer.deactivate();
       return;
     }
 
@@ -704,6 +756,48 @@
       };
       metrics.signature = layoutSignature(current, video, stage);
       stats.measures += 1;
+    }
+
+    let useWebgl = prefs.renderMode === 'webgl' && !webglBlocked;
+    let webglSkipReason = '';
+    if (useWebgl) {
+      const signature = metrics.signature || {};
+      const objectFit = String(signature.objectFit || 'contain');
+      /* contain 与 fill 都能用画面矩形直接映射；cover/scale-down 需要额外裁剪逻辑 */
+      if (objectFit !== 'contain' && objectFit !== 'fill') {
+        useWebgl = false;
+        webglSkipReason = 'object-fit:' + objectFit;
+      } else if (!isCenteredObjectPosition(signature.objectPosition)) {
+        useWebgl = false;
+        webglSkipReason = 'object-position:' + (signature.objectPosition || '');
+      } else if (state.fit !== 'contain') {
+        useWebgl = false;
+        webglSkipReason = 'fit:cover';
+      } else if (
+        !metrics.stage ||
+        metrics.stage.width < 16 ||
+        metrics.stage.height < 16 ||
+        !metrics.picture ||
+        metrics.picture.width < 1 ||
+        metrics.picture.height < 1
+      ) {
+        useWebgl = false;
+        webglSkipReason = 'stage-size';
+      }
+    }
+    webglSkipReasonCurrent = webglSkipReason;
+
+    if (useWebgl) {
+      /* WebGL 路径不能残留 CSS transform / 类，否则两条路径会互相覆盖 */
+      cancelAnim(video);
+      clearVideoStyles(video);
+      if (renderer.activate(current, metrics, currentAngle())) {
+        stats.updates += 1;
+        return;
+      }
+      /* 激活失败时 fallbackWebgl 已记录原因并安排下一次 CSS 更新，这里继续走 CSS */
+    } else if (renderer.active) {
+      renderer.deactivate();
     }
 
     const angle = currentAngle();
@@ -750,6 +844,1125 @@
     } catch (err) {
       /* 元素已失效时忽略 */
     }
+  }
+
+  /* ---------- WebGL 渲染器（实验） ---------- */
+
+  const WEBGL_CONTEXT_ATTRS = {
+    alpha: false,
+    depth: false,
+    stencil: false,
+    antialias: false,
+    premultipliedAlpha: true,
+    /* 不保留 drawing buffer：保留会带来每帧额外拷贝，明显增加 GPU 负担；
+       改为持续 rAF 从缓存纹理重绘，效果相同且不会合成到空 buffer */
+    preserveDrawingBuffer: false,
+    powerPreference: 'high-performance'
+  };
+  const WEBGL_DPR_MAX = 2;
+
+  /* 顶点坐标使用画面局部的 ±1 单位盒，y 轴向下，与 CSS rotate() 方向一致 */
+  const WEBGL_VERTEX_SRC = [
+    'attribute vec2 a_pos;',
+    'attribute vec2 a_uv;',
+    'uniform vec2 u_stage;',
+    'uniform vec2 u_origin;',
+    'uniform vec2 u_picSize;',
+    'uniform vec2 u_flip;',
+    'uniform float u_scale;',
+    'uniform float u_angle;',
+    'varying vec2 v_uv;',
+    'void main() {',
+    '  vec2 local = a_pos * (u_picSize * 0.5) * u_scale * u_flip;',
+    '  float c = cos(u_angle);',
+    '  float s = sin(u_angle);',
+    '  vec2 p = vec2(local.x * c - local.y * s, local.x * s + local.y * c) + u_origin;',
+    '  vec2 clip = vec2(p.x / u_stage.x * 2.0 - 1.0, 1.0 - p.y / u_stage.y * 2.0);',
+    '  gl_Position = vec4(clip, 0.0, 1.0);',
+    '  v_uv = a_uv;',
+    '}'
+  ].join('\n');
+
+  /* 不做 UNPACK_FLIP_Y：纹理第 0 行对应视频顶部，UV 的 v=0 取顶部 */
+  const WEBGL_FRAGMENT_SRC = [
+    'precision mediump float;',
+    'uniform sampler2D u_tex;',
+    'varying vec2 v_uv;',
+    'void main() {',
+    '  gl_FragColor = texture2D(u_tex, v_uv);',
+    '}'
+  ].join('\n');
+
+  function compileShader(gl, type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(shader);
+      gl.deleteShader(shader);
+      throw new Error('shader: ' + log);
+    }
+    return shader;
+  }
+
+  function isPositionedElement(el) {
+    if (!el || el.nodeType !== 1) return false;
+    try {
+      const position = window.getComputedStyle(el).position;
+      return !!position && position !== 'static';
+    } catch (err) {
+      return false;
+    }
+  }
+
+  /* 插到 video 所在分支之后：canvas 盖住 video，但仍在弹幕/字幕/控制条之下 */
+  function insertCanvasIntoHost(host, canvas, video) {
+    let branch = video;
+    while (branch && branch.parentNode !== host) {
+      branch = branch.parentNode;
+    }
+    if (branch && branch.parentNode === host) {
+      host.insertBefore(canvas, branch.nextSibling);
+    } else {
+      host.appendChild(canvas);
+    }
+  }
+
+  function videoHasMediaKeys(video) {
+    try {
+      return !!(video && (video.mediaKeys || video.webkitMediaKeys || video.msKeys));
+    } catch (err) {
+      return false;
+    }
+  }
+
+  const renderer = {
+    active: false,
+    canvas: null,
+    gl: null,
+    program: null,
+    quadBuffer: null,
+    quadUvBuffer: null,
+    texture: null,
+    locations: null,
+    glInfo: null,
+    texWidth: 0,
+    texHeight: 0,
+    lastUploadOk: false,
+    video: null,
+    player: null,
+    host: null,
+    hostMode: '',
+    stage: null,
+    originX: 0,
+    originY: 0,
+    picW: 0,
+    picH: 0,
+    angle: 0,
+    angleRad: 0,
+    scale: 1,
+    flipX: 1,
+    flipY: 1,
+    saved: null,
+    hiddenMode: '',
+    /* 首帧绘制成功前 canvas 保持隐藏、video 保持可见，避免先黑屏再出画 */
+    hasFrame: false,
+    revealed: false,
+    needsRedraw: false,
+    geometryKey: '',
+    lastDrawAt: 0,
+    /* 诊断计数：确认闪烁时是否仍在走 WebGL、是否发生重挂或重复激活 */
+    activations: 0,
+    rehosts: 0,
+    canvasRemovals: 0,
+    reveals: 0,
+    emptyUploads: 0,
+    frames: 0,
+    draws: 0,
+    uploads: 0,
+    uploadMs: 0,
+    drawMs: 0,
+    lastGlError: 0,
+    fallbackReason: '',
+    blackProbes: 0,
+    blackFrames: 0,
+    blackProbeDone: false,
+    frameTimer: 0,
+    rvfcId: 0,
+    rvfcPending: false,
+    rafId: 0,
+    drawRafId: 0,
+    boundScroll: null,
+    scrollBound: false,
+    boundContextLost: null,
+    disposing: false,
+    listeners: null,
+
+    createCanvas: function () {
+      if (this.canvas) return this.canvas;
+      const canvas = document.createElement('canvas');
+      canvas.id = 'bvr-webgl-canvas';
+      canvas.className = CLASS_CANVAS;
+      canvas.style.cssText =
+        'position:absolute;left:0;top:0;width:0;height:0;display:none;pointer-events:none;background:#000;';
+      this.canvas = canvas;
+      return canvas;
+    },
+
+    initGL: function () {
+      if (this.gl) return true;
+      const canvas = this.canvas;
+      let gl = null;
+      try {
+        gl =
+          canvas.getContext('webgl2', WEBGL_CONTEXT_ATTRS) ||
+          canvas.getContext('webgl', WEBGL_CONTEXT_ATTRS) ||
+          canvas.getContext('experimental-webgl', WEBGL_CONTEXT_ATTRS);
+      } catch (err) {
+        gl = null;
+      }
+      if (!gl) {
+        this.fallbackReason = 'no-context';
+        return false;
+      }
+
+      let program = null;
+      try {
+        const vs = compileShader(gl, gl.VERTEX_SHADER, WEBGL_VERTEX_SRC);
+        const fs = compileShader(gl, gl.FRAGMENT_SHADER, WEBGL_FRAGMENT_SRC);
+        program = gl.createProgram();
+        gl.attachShader(program, vs);
+        gl.attachShader(program, fs);
+        gl.linkProgram(program);
+        gl.deleteShader(vs);
+        gl.deleteShader(fs);
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+          const log = gl.getProgramInfoLog(program);
+          gl.deleteProgram(program);
+          throw new Error('link: ' + log);
+        }
+      } catch (err) {
+        this.fallbackReason = 'shader';
+        return false;
+      }
+
+      this.gl = gl;
+      this.program = program;
+      this.locations = {
+        pos: gl.getAttribLocation(program, 'a_pos'),
+        uv: gl.getAttribLocation(program, 'a_uv'),
+        stage: gl.getUniformLocation(program, 'u_stage'),
+        origin: gl.getUniformLocation(program, 'u_origin'),
+        picSize: gl.getUniformLocation(program, 'u_picSize'),
+        flip: gl.getUniformLocation(program, 'u_flip'),
+        scale: gl.getUniformLocation(program, 'u_scale'),
+        angle: gl.getUniformLocation(program, 'u_angle'),
+        tex: gl.getUniformLocation(program, 'u_tex')
+      };
+      this.quadBuffer = gl.createBuffer();
+      this.quadUvBuffer = gl.createBuffer();
+      this.texture = null;
+      this.texWidth = 0;
+      this.texHeight = 0;
+      this.lastUploadOk = false;
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
+      gl.bufferData(
+        gl.ARRAY_BUFFER,
+        new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]),
+        gl.STATIC_DRAW
+      );
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.quadUvBuffer);
+      gl.bufferData(
+        gl.ARRAY_BUFFER,
+        new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]),
+        gl.STATIC_DRAW
+      );
+
+      try {
+        this.glInfo = {
+          version: String(gl.getParameter(gl.VERSION) || ''),
+          renderer: String(gl.getParameter(gl.RENDERER) || ''),
+          vendor: String(gl.getParameter(gl.VENDOR) || ''),
+          attributes: gl.getContextAttributes ? gl.getContextAttributes() : null
+        };
+      } catch (err) {
+        this.glInfo = null;
+      }
+
+      if (!this.boundContextLost) this.boundContextLost = this.onContextLost.bind(this);
+      try {
+        canvas.addEventListener('webglcontextlost', this.boundContextLost, false);
+      } catch (err) {}
+      return true;
+    },
+
+    onContextLost: function (event) {
+      try {
+        event.preventDefault();
+      } catch (err) {}
+      /* destroy() 主动释放上下文时也会触发该事件，不能当作异常回退 */
+      if (this.disposing) return;
+      this.fallback('context-lost');
+    },
+
+    saveInlineProps: function () {
+      if (!this.video || this.saved) return;
+      const video = this.video;
+      const saved = {};
+      ['visibility', 'opacity', 'pointer-events'].forEach(function (name) {
+        saved[name] = {
+          value: video.style.getPropertyValue(name),
+          priority: video.style.getPropertyPriority(name)
+        };
+      });
+      this.saved = saved;
+    },
+
+    restoreInlineProps: function () {
+      if (!this.video || !this.saved) return;
+      const video = this.video;
+      const saved = this.saved;
+      ['visibility', 'opacity', 'pointer-events'].forEach(function (name) {
+        const item = saved[name];
+        try {
+          if (item && item.value) video.style.setProperty(name, item.value, item.priority || '');
+          else video.style.removeProperty(name);
+        } catch (err) {}
+      });
+    },
+
+    /* visibility 优先；若隐藏后取不到新帧，改用 opacity:0 再试 */
+    setHiddenMode: function (mode) {
+      const video = this.video;
+      if (!video) return;
+      if (this.hiddenMode === mode) return;
+      this.hiddenMode = mode;
+      this.restoreInlineProps();
+      try {
+        video.classList.add(CLASS_WEBGL);
+        if (mode === 'visibility') {
+          video.style.setProperty('visibility', 'hidden', 'important');
+        } else if (mode === 'opacity') {
+          video.style.setProperty('opacity', '0', 'important');
+          video.style.setProperty('pointer-events', 'none', 'important');
+        }
+      } catch (err) {}
+    },
+
+    chooseHost: function (player) {
+      const video = player.video;
+      const container = player.container;
+      const playerRoot = player.player;
+
+      let root = null;
+      try {
+        root = video.getRootNode();
+      } catch (err) {
+        root = null;
+      }
+      const sameRoot = function (el) {
+        if (!el || el.nodeType !== 1) return false;
+        if (!root) return true;
+        try {
+          return el.getRootNode() === root;
+        } catch (err) {
+          return false;
+        }
+      };
+
+      let el = container;
+      let steps = 0;
+      while (sameRoot(el) && steps < 40) {
+        if (isPositionedElement(el)) return { host: el, mode: 'absolute' };
+        if (playerRoot && el === playerRoot) break;
+        if (el === document.body || el === document.documentElement) break;
+        el = el.parentElement;
+        steps += 1;
+      }
+
+      /* 从 video 的父级开始，绝不能把 <video> 自身当作 canvas 容器 */
+      el = video.parentElement;
+      steps = 0;
+      while (sameRoot(el) && steps < 40) {
+        if (isPositionedElement(el)) return { host: el, mode: 'absolute' };
+        if (playerRoot && el === playerRoot) break;
+        if (el === document.body || el === document.documentElement) break;
+        el = el.parentElement;
+        steps += 1;
+      }
+
+      /* 回退到与 video 相同的树，避免 canvas 落在 shadow root 之外 */
+      let fixedHost = root && root.nodeType === 11 && root.host ? root : document.body;
+
+      /* 原生全屏时 canvas 必须位于全屏元素内部，否则不会被渲染 */
+      const fullscreen = getFullscreenElement();
+      if (fullscreen && fullscreen.nodeType === 1) {
+        const anchor = root && root.nodeType === 11 && root.host ? root.host : video;
+        try {
+          if (fullscreen.contains(anchor)) fixedHost = fullscreen;
+        } catch (err) {}
+      }
+
+      return { host: fixedHost, mode: 'fixed' };
+    },
+
+    ensureHost: function (player) {
+      const canvas = this.canvas;
+      if (!canvas) return false;
+      const desc = this.chooseHost(player);
+      let host = desc.host;
+      let mode = desc.mode;
+      const changed =
+        this.host !== host ||
+        this.hostMode !== mode ||
+        canvas.parentNode !== host ||
+        !canvas.isConnected;
+
+      if (changed) {
+        /* 已经挂载过说明是重挂（播放器重渲染 / 全屏切换），不是首次挂载 */
+        const wasMounted = !!(this.active && this.host);
+        try {
+          if (canvas.parentNode) canvas.parentNode.removeChild(canvas);
+        } catch (err) {}
+        try {
+          if (mode === 'absolute' && host.nodeType === 1) {
+            insertCanvasIntoHost(host, canvas, player.video);
+          } else {
+            mode = 'fixed';
+            host.appendChild(canvas);
+          }
+        } catch (err) {
+          try {
+            host = document.body;
+            mode = 'fixed';
+            host.appendChild(canvas);
+          } catch (err2) {}
+        }
+        this.host = host;
+        this.hostMode = mode;
+        if (wasMounted) this.rehosts += 1;
+        /* 重挂后 backing store 可能与舞台尺寸不一致，要求下一次激活重绘 */
+        this.needsRedraw = true;
+      }
+
+      this.updateHostBindings(this.hostMode);
+      return changed;
+    },
+
+    updateHostBindings: function (mode) {
+      if (mode === 'fixed' && !this.scrollBound) {
+        if (!this.boundScroll) this.boundScroll = this.handleScroll.bind(this);
+        try {
+          window.addEventListener('scroll', this.boundScroll, true);
+          this.scrollBound = true;
+        } catch (err) {}
+      } else if (mode !== 'fixed' && this.scrollBound) {
+        try {
+          window.removeEventListener('scroll', this.boundScroll, true);
+        } catch (err) {}
+        this.scrollBound = false;
+      }
+    },
+
+    handleScroll: function () {
+      if (this.active && this.hostMode === 'fixed') this.reposition();
+    },
+
+    applyGeometry: function (metrics, angle) {
+      if (!metrics || !metrics.picture || !metrics.stage) return false;
+      const picture = metrics.picture;
+      const stage = metrics.stage;
+      const originX = picture.left - stage.left + picture.width / 2;
+      const originY = picture.top - stage.top + picture.height / 2;
+      const scale = computeScale(picture, stage, angle);
+      const flipX = state.flipX ? -1 : 1;
+      const flipY = state.flipY ? -1 : 1;
+
+      /* 轻量几何签名：未变化时跳过重复纹理上传与绘制 */
+      const key = [
+        round1(stage.width),
+        round1(stage.height),
+        round1(originX),
+        round1(originY),
+        round1(picture.width),
+        round1(picture.height),
+        round1(angle),
+        Math.round(scale * 10000) / 10000,
+        flipX,
+        flipY
+      ].join('|');
+      const changed = key !== this.geometryKey;
+
+      this.stage = stage;
+      this.angle = angle;
+      this.angleRad = (angle * Math.PI) / 180;
+      this.originX = originX;
+      this.originY = originY;
+      this.picW = picture.width;
+      this.picH = picture.height;
+      this.scale = scale;
+      this.flipX = flipX;
+      this.flipY = flipY;
+      this.geometryKey = key;
+      return changed;
+    },
+
+    reposition: function () {
+      const canvas = this.canvas;
+      const stage = this.stage;
+      if (!canvas || !stage) return;
+
+      let left = stage.left;
+      let top = stage.top;
+
+      if (this.player) {
+        /* stage 可能因滚动/进入全屏而移动；尺寸以 metrics 快照为准，位置取当前值 */
+        const fresh = resolveStage(this.player, null);
+        if (fresh && fresh.width >= 1 && fresh.height >= 1) {
+          if (this.hostMode === 'absolute' && this.host && this.host.nodeType === 1) {
+            const hostRect = nodeRect(this.host);
+            if (hostRect) {
+              left = fresh.left - hostRect.left - (this.host.clientLeft || 0);
+              top = fresh.top - hostRect.top - (this.host.clientTop || 0);
+            }
+          } else if (this.hostMode === 'fixed') {
+            left = fresh.left;
+            top = fresh.top;
+          }
+        }
+      }
+
+      if (!isFinite(left) || !isFinite(top) || stage.width < 1 || stage.height < 1) return;
+
+      const style = canvas.style;
+      const leftText = round1(left) + 'px';
+      const topText = round1(top) + 'px';
+      const widthText = round1(stage.width) + 'px';
+      const heightText = round1(stage.height) + 'px';
+      if (style.left !== leftText) style.left = leftText;
+      if (style.top !== topText) style.top = topText;
+      if (style.width !== widthText) style.width = widthText;
+      if (style.height !== heightText) style.height = heightText;
+      if (style.position !== (this.hostMode === 'fixed' ? 'fixed' : 'absolute')) {
+        style.position = this.hostMode === 'fixed' ? 'fixed' : 'absolute';
+      }
+    },
+
+    resize: function () {
+      const canvas = this.canvas;
+      const stage = this.stage;
+      if (!canvas || !stage) return false;
+      const dpr = Math.min(window.devicePixelRatio || 1, WEBGL_DPR_MAX);
+      const width = Math.max(1, Math.round(stage.width * dpr));
+      const height = Math.max(1, Math.round(stage.height * dpr));
+      const changed = canvas.width !== width || canvas.height !== height;
+      if (changed) {
+        /* 修改 backing store 会清空 drawing buffer，调用方必须在同一任务内重绘 */
+        canvas.width = width;
+        canvas.height = height;
+      }
+      return changed;
+    },
+
+    uploadFrame: function () {
+      const video = this.video;
+      const gl = this.gl;
+      if (!video || !gl) return false;
+      if (video.readyState < 2 || !video.videoWidth || !video.videoHeight) return false;
+
+      const started = performance.now();
+      try {
+        if (!this.texture) {
+          this.texture = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, this.texture);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        } else {
+          gl.bindTexture(gl.TEXTURE_2D, this.texture);
+        }
+
+        if (this.texWidth !== video.videoWidth || this.texHeight !== video.videoHeight) {
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+          this.texWidth = video.videoWidth;
+          this.texHeight = video.videoHeight;
+        } else {
+          gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, video);
+        }
+      } catch (err) {
+        /* 跨域 / DRM / 上下文丢失：交给回退逻辑 */
+        try {
+          this.lastGlError = gl.getError();
+        } catch (err2) {}
+        this.fallback('texture');
+        return false;
+      }
+
+      this.uploads += 1;
+      this.uploadMs += performance.now() - started;
+      this.lastUploadOk = true;
+      /* getError 会打断 GPU 流水线，只在异常时或低频抽样时查询 */
+      if (this.uploads % 120 === 0) {
+        try {
+          const error = gl.getError();
+          if (error !== gl.NO_ERROR) this.lastGlError = error;
+        } catch (err) {}
+      }
+      return true;
+    },
+
+    renderFrame: function () {
+      if (!this.active) return;
+      const gl = this.gl;
+      if (!gl || !this.canvas || !this.stage) return;
+
+      this.frames += 1;
+      this.uploadFrame();
+      if (!this.active || !this.gl) return;
+
+      /* 还没有任何有效纹理时不要清屏：清屏会把画面擦成黑色 */
+      if (!this.texture || !this.lastUploadOk) {
+        this.emptyUploads += 1;
+        this.noteFrame();
+        return;
+      }
+      /* 当前帧上传失败（readyState/seeking）时保留上一帧纹理继续绘制 */
+      this.drawFrame();
+      this.probeBlackFrame();
+      this.noteFrame();
+    },
+
+    /* 只用缓存纹理重绘：drawing buffer 不保留，需要每个显示帧重画一次 */
+    drawFrame: function () {
+      if (!this.active) return false;
+      const gl = this.gl;
+      const canvas = this.canvas;
+      if (!gl || !canvas || !this.stage) return false;
+      if (!this.texture || !this.lastUploadOk) return false;
+
+      const started = performance.now();
+      try {
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.clearColor(0, 0, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+
+        const loc = this.locations;
+        gl.useProgram(this.program);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, this.texture);
+        gl.uniform1i(loc.tex, 0);
+        gl.uniform2f(loc.stage, this.stage.width, this.stage.height);
+        gl.uniform2f(loc.origin, this.originX, this.originY);
+        gl.uniform2f(loc.picSize, this.picW, this.picH);
+        gl.uniform2f(loc.flip, this.flipX, this.flipY);
+        gl.uniform1f(loc.scale, this.scale);
+        gl.uniform1f(loc.angle, this.angleRad);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
+        gl.enableVertexAttribArray(loc.pos);
+        gl.vertexAttribPointer(loc.pos, 2, gl.FLOAT, false, 0, 0);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.quadUvBuffer);
+        gl.enableVertexAttribArray(loc.uv);
+        gl.vertexAttribPointer(loc.uv, 2, gl.FLOAT, false, 0, 0);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      } catch (err) {
+        this.fallback('draw');
+        return false;
+      }
+      this.draws += 1;
+      this.drawMs += performance.now() - started;
+      this.lastDrawAt = performance.now();
+
+      /* 首帧成功绘制后才显示 canvas 并隐藏 video */
+      this.hasFrame = true;
+      if (!this.reveal()) this.needsRedraw = true;
+      return true;
+    },
+
+    /* 持续 rAF 重绘：避免播放器 UI 重绘 / 重合成时读到已清空的 drawing buffer */
+    startDrawLoop: function () {
+      if (!this.active || this.drawRafId) return;
+      if (document.visibilityState === 'hidden') return;
+      const self = this;
+      this.drawRafId = window.requestAnimationFrame(function () {
+        self.drawRafId = 0;
+        if (!self.active) return;
+        /* rVFC 刚在同一帧内画过就跳过，避免重复绘制 */
+        if (performance.now() - self.lastDrawAt >= 3) self.drawFrame();
+        self.startDrawLoop();
+      });
+    },
+
+    stopDrawLoop: function () {
+      if (!this.drawRafId) return;
+      try {
+        window.cancelAnimationFrame(this.drawRafId);
+      } catch (err) {}
+      this.drawRafId = 0;
+    },
+
+    /* 先显示已画好内容的 canvas，再隐藏 video；重复调用不会反复切换 */
+    reveal: function () {
+      if (!this.active || !this.canvas || !this.canvas.isConnected) return false;
+      if (!this.revealed) {
+        this.revealed = true;
+        this.reveals += 1;
+      }
+      if (this.canvas.style.display !== 'block') {
+        try {
+          this.canvas.style.display = 'block';
+        } catch (err) {}
+      }
+      /* 已经因取不到帧降级到 opacity:0 时不要来回切回 visibility */
+      this.setHiddenMode(this.hiddenMode || 'visibility');
+      return true;
+    },
+
+    scheduleFrame: function () {
+      if (!this.active || this.rvfcPending || this.rafId) return;
+      const video = this.video;
+      if (!video || document.visibilityState === 'hidden') return;
+
+      const requestFrame =
+        video.requestVideoFrameCallback || video.webkitRequestVideoFrameCallback;
+      if (typeof requestFrame === 'function') {
+        const self = this;
+        this.rvfcPending = true;
+        this.rvfcId = requestFrame.call(video, function () {
+          self.rvfcPending = false;
+          self.rvfcId = 0;
+          if (!self.active) return;
+          self.renderFrame();
+          if (self.active && self.video && !self.video.paused) self.scheduleFrame();
+        });
+        return;
+      }
+
+      const self = this;
+      this.rafId = window.requestAnimationFrame(function () {
+        self.rafId = 0;
+        if (!self.active) return;
+        self.renderFrame();
+        if (self.active && self.video && !self.video.paused) self.scheduleFrame();
+      });
+    },
+
+    stopLoop: function () {
+      const video = this.video;
+      const cancelFrame =
+        video && (video.cancelVideoFrameCallback || video.webkitCancelVideoFrameCallback);
+      if (this.rvfcId && typeof cancelFrame === 'function') {
+        try {
+          cancelFrame.call(video, this.rvfcId);
+        } catch (err) {}
+      }
+      this.rvfcId = 0;
+      this.rvfcPending = false;
+      if (this.rafId) {
+        try {
+          window.cancelAnimationFrame(this.rafId);
+        } catch (err) {}
+        this.rafId = 0;
+      }
+      if (this.frameTimer) {
+        window.clearTimeout(this.frameTimer);
+        this.frameTimer = 0;
+      }
+    },
+
+    startWatchdog: function () {
+      const video = this.video;
+      if (!this.active || !video || video.paused || document.visibilityState === 'hidden') return;
+      if (this.frameTimer) window.clearTimeout(this.frameTimer);
+      const self = this;
+      this.frameTimer = window.setTimeout(function () {
+        self.frameTimer = 0;
+        if (!self.active) return;
+        const current = self.video;
+        if (!current || current.paused || document.visibilityState === 'hidden') return;
+        if (current.readyState < 3 || current.seeking) {
+          self.startWatchdog();
+          return;
+        }
+        /* 纯音频 / 无法取到画面尺寸时没有可渲染内容 */
+        if (!current.videoWidth || !current.videoHeight) {
+          self.fallback('no-dimensions');
+          return;
+        }
+        if (self.hiddenMode === 'visibility') {
+          /* 隐藏元素可能不再产出视频帧，退一步用 opacity:0 保持合成 */
+          self.setHiddenMode('opacity');
+          /* 旧的 rVFC 可能永远不会触发，先取消再重新排队 */
+          self.stopLoop();
+          self.scheduleFrame();
+          self.startWatchdog();
+          return;
+        }
+        self.fallback('no-frames');
+      }, 2000);
+    },
+
+    noteFrame: function () {
+      if (!this.active) return;
+      if (this.frameTimer) {
+        window.clearTimeout(this.frameTimer);
+        this.frameTimer = 0;
+      }
+      this.startWatchdog();
+    },
+
+    /* 首次播放后低频抽样画面中心，连续全黑视为 DRM/纹理异常 */
+    probeBlackFrame: function () {
+      if (this.blackProbeDone || !this.lastUploadOk || !this.gl) return;
+      this.blackProbes += 1;
+      if (this.blackProbes < 15 || this.blackProbes % 15 !== 0) return;
+      if (this.blackProbes > 150) {
+        this.blackProbeDone = true;
+        return;
+      }
+
+      const gl = this.gl;
+      const canvas = this.canvas;
+      const stage = this.stage;
+      if (!canvas || !stage || stage.width < 1 || stage.height < 1) return;
+
+      const c = Math.cos(this.angleRad);
+      const s = Math.sin(this.angleRad);
+      const halfW = this.picW / 2;
+      const halfH = this.picH / 2;
+      const locals = [
+        [0, 0],
+        [halfW * 0.5, 0],
+        [-halfW * 0.5, 0],
+        [0, halfH * 0.5],
+        [0, -halfH * 0.5]
+      ];
+      const buffer = new Uint8Array(4);
+      let lit = false;
+
+      try {
+        for (let i = 0; i < locals.length; i += 1) {
+          const lx = locals[i][0] * this.scale * this.flipX;
+          const ly = locals[i][1] * this.scale * this.flipY;
+          const x = lx * c - ly * s + this.originX;
+          const y = lx * s + ly * c + this.originY;
+          const px = Math.round((x / stage.width) * canvas.width);
+          const py = Math.round(canvas.height - (y / stage.height) * canvas.height);
+          const cx = clamp(px, 0, canvas.width - 1);
+          const cy = clamp(py, 0, canvas.height - 1);
+          gl.readPixels(cx, cy, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, buffer);
+          if (buffer[0] > 6 || buffer[1] > 6 || buffer[2] > 6) {
+            lit = true;
+            break;
+          }
+        }
+      } catch (err) {
+        this.blackProbeDone = true;
+        return;
+      }
+
+      if (lit) {
+        this.blackProbeDone = true;
+        this.blackFrames = 0;
+        return;
+      }
+
+      this.blackFrames += 1;
+      /* EME 受保护内容直接回退；普通视频需连续约 4 秒全黑才算异常 */
+      if (videoHasMediaKeys(this.video) || this.blackFrames >= 8) {
+        this.fallback('black-frames');
+      }
+    },
+
+    attachMedia: function () {
+      if (this.listeners || !this.video) return;
+      const video = this.video;
+      const self = this;
+      this.listeners = {
+        play: function () {
+          if (!self.active) return;
+          self.startDrawLoop();
+          self.startWatchdog();
+          self.scheduleFrame();
+        },
+        playing: function () {
+          if (!self.active) return;
+          self.startDrawLoop();
+          self.startWatchdog();
+          self.scheduleFrame();
+        },
+        pause: function () {
+          if (!self.active) return;
+          self.stopLoop();
+          self.renderFrame();
+        },
+        seeked: function () {
+          if (!self.active) return;
+          self.renderFrame();
+        },
+        loadedmetadata: function () {
+          if (!self.active) return;
+          self.texWidth = 0;
+          self.texHeight = 0;
+          self.renderFrame();
+        },
+        loadeddata: function () {
+          if (!self.active) return;
+          self.renderFrame();
+        },
+        canplay: function () {
+          if (!self.active) return;
+          self.renderFrame();
+          if (!self.video.paused) self.scheduleFrame();
+        },
+        durationchange: function () {
+          if (!self.active) return;
+          self.texWidth = 0;
+          self.texHeight = 0;
+          self.renderFrame();
+        },
+        resize: function () {
+          if (!self.active) return;
+          self.texWidth = 0;
+          self.texHeight = 0;
+          self.renderFrame();
+        }
+      };
+      Object.keys(this.listeners).forEach(function (name) {
+        try {
+          video.addEventListener(name, self.listeners[name]);
+        } catch (err) {}
+      });
+    },
+
+    detachMedia: function () {
+      const video = this.video;
+      const listeners = this.listeners;
+      this.listeners = null;
+      if (!video || !listeners) return;
+      Object.keys(listeners).forEach(function (name) {
+        try {
+          video.removeEventListener(name, listeners[name]);
+        } catch (err) {}
+      });
+    },
+
+    onHidden: function () {
+      this.stopLoop();
+      this.stopDrawLoop();
+    },
+
+    onVisible: function () {
+      if (!this.active) return;
+      this.renderFrame();
+      this.startDrawLoop();
+      if (this.video && !this.video.paused) {
+        this.startWatchdog();
+        this.scheduleFrame();
+      }
+    },
+
+    activate: function (player, metrics, angle) {
+      this.activations += 1;
+      if (this.gl && this.gl.isContextLost && this.gl.isContextLost()) this.destroy();
+      const video = player.video;
+      const freshVideo = this.video !== video;
+      if (this.video && freshVideo) this.destroy();
+
+      this.player = player;
+      this.video = video;
+      this.createCanvas();
+      this.saveInlineProps();
+
+      if (!this.initGL()) {
+        this.fallback(this.fallbackReason || 'init');
+        return false;
+      }
+
+      this.active = true;
+      if (freshVideo) {
+        this.blackProbes = 0;
+        this.blackFrames = 0;
+        this.blackProbeDone = false;
+        this.hasFrame = false;
+        this.revealed = false;
+        this.geometryKey = '';
+        this.needsRedraw = true;
+      }
+
+      /* 几何 / 宿主是幂等的：重复激活只更新，不重复上传纹理 */
+      const geometryChanged = this.applyGeometry(metrics, angle);
+      this.ensureHost(player);
+      if (!this.canvas || !this.canvas.isConnected) {
+        this.fallback('host');
+        return false;
+      }
+      /* canvas 先按舞台尺寸定位并调整 backing store，renderFrame 才能安全绘制 */
+      this.reposition();
+      const resized = this.resize();
+
+      const redraw = this.needsRedraw || resized || geometryChanged || !this.hasFrame || !this.revealed;
+      this.needsRedraw = false;
+      if (redraw) this.renderFrame();
+      if (!this.active) return false;
+
+      this.attachMedia();
+      /* 持续重绘与是否播放无关：暂停时 UI 重绘同样需要现成的 canvas 内容 */
+      this.startDrawLoop();
+      if (!video.paused) this.scheduleFrame();
+      return true;
+    },
+
+    deactivate: function () {
+      this.stopLoop();
+      this.stopDrawLoop();
+      this.active = false;
+      this.detachMedia();
+      /* 先恢复 video 可见、再隐藏 canvas，同一任务内完成，避免中间帧露出黑底 */
+      this.restoreInlineProps();
+      this.hiddenMode = '';
+      if (this.video) {
+        try {
+          this.video.classList.remove(CLASS_WEBGL);
+        } catch (err) {}
+      }
+      if (this.canvas) {
+        try {
+          this.canvas.style.display = 'none';
+        } catch (err) {}
+      }
+      if (this.scrollBound) {
+        try {
+          window.removeEventListener('scroll', this.boundScroll, true);
+        } catch (err) {}
+        this.scrollBound = false;
+      }
+      this.hasFrame = false;
+      this.revealed = false;
+      this.geometryKey = '';
+      this.needsRedraw = false;
+      this.lastDrawAt = 0;
+      /* 下次启动时重新记录当时的 inline 样式，避免覆盖站点期间的改动 */
+      this.saved = null;
+    },
+
+    destroy: function () {
+      this.deactivate();
+      this.disposing = true;
+      const gl = this.gl;
+      const canvas = this.canvas;
+      if (gl) {
+        try {
+          if (this.texture) gl.deleteTexture(this.texture);
+          if (this.quadBuffer) gl.deleteBuffer(this.quadBuffer);
+          if (this.quadUvBuffer) gl.deleteBuffer(this.quadUvBuffer);
+          if (this.program) gl.deleteProgram(this.program);
+          if (!(gl.isContextLost && gl.isContextLost())) {
+            const lose = gl.getExtension('WEBGL_lose_context');
+            if (lose) lose.loseContext();
+          }
+        } catch (err) {}
+      }
+      if (canvas) {
+        if (this.boundContextLost) {
+          try {
+            canvas.removeEventListener('webglcontextlost', this.boundContextLost, false);
+          } catch (err) {}
+        }
+        try {
+          if (canvas.parentNode) canvas.parentNode.removeChild(canvas);
+        } catch (err) {}
+      }
+      this.canvas = null;
+      this.gl = null;
+      this.program = null;
+      this.locations = null;
+      this.quadBuffer = null;
+      this.quadUvBuffer = null;
+      this.texture = null;
+      this.glInfo = null;
+      this.texWidth = 0;
+      this.texHeight = 0;
+      this.lastUploadOk = false;
+      this.host = null;
+      this.hostMode = '';
+      this.video = null;
+      this.player = null;
+      this.saved = null;
+      this.stage = null;
+      this.disposing = false;
+    },
+
+    fallback: function (reason) {
+      this.fallbackReason = reason || this.fallbackReason || 'unknown';
+      fallbackWebgl(this.fallbackReason);
+    },
+
+    describe: function () {
+      const video = this.video;
+      let quality = null;
+      if (video && typeof video.getVideoPlaybackQuality === 'function') {
+        try {
+          quality = video.getVideoPlaybackQuality();
+        } catch (err) {
+          quality = null;
+        }
+      }
+      return {
+        active: this.active,
+        fallbackReason: this.fallbackReason || webglFallbackReason || '',
+        hiddenMode: this.hiddenMode,
+        host: this.host
+          ? (this.host.nodeType === 11 ? 'shadow-root' : describeNode(this.host))
+          : null,
+        hostMode: this.hostMode,
+        canvas: this.canvas ? describeNode(this.canvas) : null,
+        canvasRect: this.canvas ? rectSummary(nodeRect(this.canvas)) : null,
+        backingStore: this.canvas ? this.canvas.width + 'x' + this.canvas.height : '',
+        dpr: Math.min(window.devicePixelRatio || 1, WEBGL_DPR_MAX),
+        texture: this.texWidth && this.texHeight ? this.texWidth + 'x' + this.texHeight : '',
+        gl: this.glInfo,
+        hasFrame: this.hasFrame,
+        revealed: this.revealed,
+        activations: this.activations,
+        rehosts: this.rehosts,
+        canvasRemovals: this.canvasRemovals,
+        reveals: this.reveals,
+        emptyUploads: this.emptyUploads,
+        frames: this.frames,
+        draws: this.draws,
+        uploads: this.uploads,
+        avgUploadMs: this.uploads
+          ? Math.round((this.uploadMs / this.uploads) * 100) / 100
+          : null,
+        avgDrawMs: this.draws
+          ? Math.round((this.drawMs / this.draws) * 100) / 100
+          : null,
+        lastGlError: this.lastGlError,
+        videoVisibility: video ? video.style.getPropertyValue('visibility') : '',
+        videoOpacity: video ? video.style.getPropertyValue('opacity') : '',
+        videoClassActive: video && video.classList ? video.classList.contains(CLASS_ACTIVE) : false,
+        videoClassWebgl: video && video.classList ? video.classList.contains(CLASS_WEBGL) : false,
+        quality: quality
+          ? { total: quality.totalVideoFrames, dropped: quality.droppedVideoFrames }
+          : null
+      };
+    }
+  };
+
+  function fallbackWebgl(reason) {
+    if (webglBlocked) return;
+    webglBlocked = true;
+    webglFallbackReason = reason || 'unknown';
+    renderer.fallbackReason = webglFallbackReason;
+    try {
+      console.warn('[bilibili-video-rotate] WebGL 渲染回退到 CSS：' + webglFallbackReason);
+    } catch (err) {}
+    /* 保留 metrics：本次 updateTransform 仍可继续绘制 CSS 路径 */
+    renderer.destroy();
+    scheduleUpdate(false);
   }
 
   /* ---------- 会话状态 ---------- */
@@ -961,6 +2174,11 @@
     '    <button id="bvr-fit-cover" type="button">铺满</button>',
     '    <button id="bvr-fit-contain" type="button">完整显示</button>',
     '  </div>',
+    '  <div class="bvr-label"><span>渲染</span></div>',
+    '  <div class="bvr-row">',
+    '    <button id="bvr-render-css" type="button" title="使用 CSS transform 旋转（默认，兼容性最好）">CSS</button>',
+    '    <button id="bvr-render-webgl" type="button" title="WebGL 可能降低旋转时的 GPU 占用，但不支持 HDR/DRM，可能黑屏或颜色异常，异常时自动回退">WebGL（实验）</button>',
+    '  </div>',
     '  <div class="bvr-row">',
     '    <button id="bvr-reset" type="button">重置</button>',
     '    <button id="bvr-close2" type="button">关闭</button>',
@@ -980,6 +2198,8 @@
   const fitContain = shadow.getElementById('bvr-fit-contain');
   const flipXBtn = shadow.getElementById('bvr-flip-x');
   const flipYBtn = shadow.getElementById('bvr-flip-y');
+  const renderCssBtn = shadow.getElementById('bvr-render-css');
+  const renderWebglBtn = shadow.getElementById('bvr-render-webgl');
 
   let panelOpen = false;
   let drag = null;
@@ -1052,6 +2272,11 @@
     flipYBtn.classList.toggle('bvr-on', state.flipY);
     flipXBtn.setAttribute('aria-pressed', state.flipX ? 'true' : 'false');
     flipYBtn.setAttribute('aria-pressed', state.flipY ? 'true' : 'false');
+    const webglMode = prefs.renderMode === 'webgl';
+    renderCssBtn.classList.toggle('bvr-on', !webglMode);
+    renderWebglBtn.classList.toggle('bvr-on', webglMode);
+    renderCssBtn.setAttribute('aria-pressed', !webglMode ? 'true' : 'false');
+    renderWebglBtn.setAttribute('aria-pressed', webglMode ? 'true' : 'false');
     btn.classList.toggle('bvr-active', isTransformActive());
     btn.setAttribute('aria-pressed', isTransformActive() ? 'true' : 'false');
   }
@@ -1102,6 +2327,40 @@
     prefs.fit = state.fit;
     store.set(KEY_PREFS, prefs);
     scheduleUpdate(true);
+    syncUI();
+  }
+
+  function setRenderMode(mode) {
+    const next = mode === 'webgl' ? 'webgl' : 'css';
+    if (prefs.renderMode === next) {
+      /* 再次点击当前模式：清除本视频的回退标记，允许手动重试 */
+      if (next === 'webgl' && (webglBlocked || renderer.fallbackReason)) {
+        webglBlocked = false;
+        webglFallbackReason = '';
+        renderer.fallbackReason = '';
+        metrics = null;
+        scheduleUpdate(false);
+        syncUI();
+      }
+      return;
+    }
+    prefs.renderMode = next;
+    store.set(KEY_PREFS, prefs);
+
+    /* 立即停止旧路径并恢复 video，再交给下一次更新启动新路径 */
+    webglBlocked = false;
+    webglFallbackReason = '';
+    renderer.fallbackReason = '';
+    if (renderer.active) renderer.destroy();
+    if (activePlayer) clearVideoStyles(activePlayer.video);
+    metrics = null;
+
+    try {
+      console.info(
+        '[bilibili-video-rotate] 渲染模式：' + (next === 'webgl' ? 'WebGL（实验）' : 'CSS')
+      );
+    } catch (err) {}
+    scheduleUpdate(false);
     syncUI();
   }
 
@@ -1237,6 +2496,12 @@
   });
   flipYBtn.addEventListener('click', function () {
     toggleFlip('y');
+  });
+  renderCssBtn.addEventListener('click', function () {
+    setRenderMode('css');
+  });
+  renderWebglBtn.addEventListener('click', function () {
+    setRenderMode('webgl');
   });
   shadow.getElementById('bvr-reset').addEventListener('click', function () {
     resetTransform();
@@ -1454,6 +2719,17 @@
         container: describeNode(activePlayer && activePlayer.container),
         flipX: state.flipX,
         flipY: state.flipY,
+        renderMode: prefs.renderMode,
+        webglActive: renderer.active,
+        webglBlocked: webglBlocked,
+        fallbackReason: webglFallbackReason,
+        webglCounters: {
+          activations: renderer.activations,
+          rehosts: renderer.rehosts,
+          canvasRemovals: renderer.canvasRemovals,
+          reveals: renderer.reveals,
+          emptyUploads: renderer.emptyUploads
+        },
         appliedClass: false,
         stats: { updates: stats.updates, writes: stats.writes, measures: stats.measures }
       });
@@ -1522,6 +2798,19 @@
       appliedFlipX: appliedFlipX,
       appliedFlipY: appliedFlipY,
       appliedClass: appliedClass,
+      renderMode: prefs.renderMode,
+      webglActive: renderer.active,
+      webglBlocked: webglBlocked,
+      webglSkipReason: webglSkipReasonCurrent,
+      fallbackReason: webglFallbackReason || renderer.fallbackReason || '',
+      webglCounters: {
+        activations: renderer.activations,
+        rehosts: renderer.rehosts,
+        canvasRemovals: renderer.canvasRemovals,
+        reveals: renderer.reveals,
+        emptyUploads: renderer.emptyUploads
+      },
+      webgl: renderer.describe(),
       stats: { updates: stats.updates, writes: stats.writes, measures: stats.measures },
       metricsCached: !!metrics,
       metrics: metrics
@@ -1716,6 +3005,10 @@
     const found = findActivePlayer(mediaChanged ? null : trackedVideo);
 
     if (mediaChanged) {
+      if (renderer.active) renderer.destroy();
+      webglBlocked = false;
+      webglFallbackReason = '';
+      renderer.fallbackReason = '';
       resetTransformState('media-change');
       syncUI();
     }
@@ -1730,6 +3023,7 @@
     if (!found) {
       cancelAnim();
       metrics = null;
+      if (renderer.active) renderer.destroy();
       if (activePlayer) clearVideoStyles(activePlayer.video);
       activePlayer = null;
       /* 旧节点仍连接时保留身份锚点，避免下一次 detect 误判为节点被替换 */
@@ -1753,6 +3047,11 @@
     if (videoChanged) {
       metrics = null;
       cancelAnim();
+      if (renderer.active) renderer.destroy();
+      /* 新 video 元素允许重新尝试实验模式；同一视频失败后不再重试 */
+      webglBlocked = false;
+      webglFallbackReason = '';
+      renderer.fallbackReason = '';
       if (trackedVideo) clearVideoStyles(trackedVideo);
     }
 
@@ -1816,9 +3115,38 @@
     return false;
   }
 
+  /* canvas 被播放器重渲染移除时立即重挂，不等 250ms 节流，避免露出黑底 */
+  function repairCanvas() {
+    const canvas = renderer.canvas;
+    if (!renderer.active || !canvas || canvas.isConnected) return false;
+    renderer.canvasRemovals += 1;
+
+    const player = activePlayer;
+    if (!player || !player.video || !player.video.isConnected) {
+      renderer.deactivate();
+      scheduleUpdate(false);
+      return false;
+    }
+
+    renderer.ensureHost(player);
+    if (!renderer.canvas || !renderer.canvas.isConnected) {
+      /* 重挂失败就恢复 video，交给下一次更新重新激活 */
+      renderer.deactivate();
+      scheduleUpdate(false);
+      return false;
+    }
+
+    renderer.reposition();
+    renderer.resize();
+    renderer.renderFrame();
+    return true;
+  }
+
   function startMutationObserver() {
     if (mutationObserver || !document.body) return;
     mutationObserver = new MutationObserver(function (records) {
+      /* canvas 被移除时优先修复；其余结构变化仍走 250ms 节流 */
+      repairCanvas();
       /* video 已断开时立即视为相关；弹幕/浮层等无关键点直接忽略 */
       const stale = !!(activePlayer && activePlayer.video && !activePlayer.video.isConnected);
       if (!stale && !hasStructureChange(records)) return;
@@ -1858,6 +3186,8 @@
 
     if (!shadowObserver) {
       shadowObserver = new window.MutationObserver(function (records) {
+        /* shadow root 内的 canvas 移除同样要立即重挂 */
+        repairCanvas();
         const stale = !!(activePlayer && activePlayer.video && !activePlayer.video.isConnected);
         if (!stale && !hasStructureChange(records)) return;
         if (shadowTimer) return;
@@ -1891,8 +3221,10 @@
   function handleVisibilityChange() {
     if (document.visibilityState === 'hidden') {
       persistSession();
+      if (renderer.active) renderer.onHidden();
       return;
     }
+    if (renderer.active) renderer.onVisible();
     scheduleRestore();
   }
 
@@ -1969,6 +3301,10 @@
     GM_registerMenuCommand('垂直镜像 / 还原', function () {
       if (!activePlayer) detect();
       toggleFlip('y');
+    });
+    GM_registerMenuCommand('切换 CSS / WebGL 渲染', function () {
+      if (!activePlayer) detect();
+      setRenderMode(prefs.renderMode === 'webgl' ? 'css' : 'webgl');
     });
     GM_registerMenuCommand('重置悬浮按钮位置', function () {
       iconPos = { edge: 'right', top: defaultIconTop() };
